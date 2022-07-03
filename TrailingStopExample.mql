@@ -1,0 +1,142 @@
+//fixed trailing stop
+
+#property copyright "Copyright 2022, Aharon Zbaida"
+#property link      "https://www.anitani.us"
+#property version   "1.00"
+#property strict
+
+/*
+Rules:
+- Only apply TS is better than entry price
+- Only apply TS if better than current trailing stop
+*/
+
+input int InpTrailingStopPoints = 900;          // Trailing stop
+input int InpMinimumRange = 50;
+input int FastMAperiod  = 2;
+input int SlowMAperiod  = 13;
+input int SlowMaShift   = 0;
+input int InpMagicNumber = 12121;
+input string InpTradeComment = "ts";
+input double InpVolume = 0.01;
+
+int     digits;
+double StopLoss;
+
+int OnInit() {
+   StopLoss =  SymbolInfoDouble(Symbol(), SYMBOL_POINT)*InpTrailingStopPoints;
+   digits   =  (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS);
+   MathSrand(GetTickCount());
+   return(INIT_SUCCEEDED);
+}
+
+
+void OnTick() {
+   // create some dummy trades
+   CreateTrades(Symbol(), InpVolume, StopLoss, InpMagicNumber, InpTradeComment);
+   
+   // apply TS
+   ApplyTrailingStop(Symbol(), InpMagicNumber, StopLoss, digits);
+}
+
+
+void CreateTrades(string symbol, double volume,double SL, int magicNumber, string tradeComment) { //SL is StopLoss
+   //
+   int buyCount = 0;
+   int sellCount = 0;
+   int count = OrdersTotal();
+   double slowMa0=0, slowMa1=0, fastMa0=0, fastMa1=0;
+   
+   for(int i=count-1; i>=0; i--) {
+      
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) {
+         //
+         if(OrderSymbol()==symbol && OrderMagicNumber()==magicNumber) {
+            if(OrderType()==ORDER_TYPE_BUY) buyCount++;
+            if(OrderType()==ORDER_TYPE_SELL) sellCount++;
+         }
+      }
+   }
+   /*
+   if(buyCount==0) {
+      if(OrderSend(symbol, ORDER_TYPE_BUY, volume, Ask, 0, 0, 0, tradeComment, magicNumber)) {}
+   }
+   if(sellCount==0) {
+      if(OrderSend(symbol, ORDER_TYPE_SELL, volume, Bid, 0, Bid+StopLoss, 0, tradeComment, magicNumber)) {}
+   }
+   */
+   
+   
+   if(buyCount==0 && sellCount==0) {
+      //ma=iMA(NULL,0,MovingPeriod,MovingShift,MODE_SMA,PRICE_CLOSE,0);
+      //ma1=iMA(NULL,0,MovingPeriod,MovingShift,MODE_SMA,PRICE_CLOSE,1);
+      slowMa0=iMA(NULL,0,SlowMAperiod,SlowMaShift,MODE_SMA,PRICE_CLOSE,0);
+      slowMa1=iMA(NULL,0,SlowMAperiod,SlowMaShift,MODE_SMA,PRICE_CLOSE,1);
+      
+      fastMa0=iMA(NULL,0,FastMAperiod,0,MODE_SMA,PRICE_CLOSE,0);
+      fastMa1=iMA(NULL,0,FastMAperiod,0,MODE_SMA,PRICE_CLOSE,1);
+      
+      
+      bool barUp       = Close[0] > Open[0];
+      bool barDn       = Close[0] < Open[0];
+      
+      bool minRng      = MathAbs(Close[0]-Open[0]) >= InpMinimumRange*Point;
+      
+      bool clsGTfastMa = Close[0] > fastMa0;
+      bool clsLTfastMa = Close[0] < fastMa0;
+      //Print("fastMa0=",fastMa0);
+      //return;
+      bool fastMaUp    = fastMa0 > fastMa1;
+      bool fastMaDn    = fastMa0 < fastMa1;
+      
+      bool slowMaUp    = slowMa0 > slowMa1;
+      bool slowMaDn    = slowMa0 < slowMa1;
+      
+      bool opn2LTfastMA= Open[2] < fastMa0;
+      bool opn2GTfastMA= Open[2] > fastMa0;
+      
+      // chain entry conditions
+      if( fastMaUp && barUp && minRng && opn2LTfastMA && slowMaUp && clsGTfastMa){ //rand()>32768/2) {(/*  */  
+         if(OrderSend(symbol, ORDER_TYPE_BUY, volume, Ask, 0, NormalizeDouble(SymbolInfoDouble(symbol, SYMBOL_BID)-SL, digits), 0, tradeComment, magicNumber)) {
+            return;
+         }
+      }
+      //ma down slope, crossed below ma, last bar down, meeting minimum range 
+      if( fastMaDn && barDn && minRng && opn2GTfastMA && slowMaDn && clsLTfastMa) { ///*   */  )
+            if(OrderSend(symbol, ORDER_TYPE_SELL, volume, Bid, 0, NormalizeDouble(SymbolInfoDouble(symbol, SYMBOL_ASK)+SL, digits), 0, tradeComment, magicNumber)) {
+               return;
+            }
+      } 
+   }
+}
+
+
+
+void  ApplyTrailingStop(string symbol, int magicNumber, double stopLoss, int digitz) {
+   //Print("hello from ApplyTrailingStop");
+   
+   // Trailing from the close prices
+   double   buyStopLoss    =  NormalizeDouble(SymbolInfoDouble(symbol, SYMBOL_ASK)-stopLoss, digitz);
+      //Print("buyStopLoss    =",buyStopLoss    );
+   double   sellStopLoss   =  NormalizeDouble(SymbolInfoDouble(symbol, SYMBOL_BID)+stopLoss, digitz);;
+   int      count          =  OrdersTotal();
+   for (int i=count-1; i>=0; i--) {
+      if (OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) {
+         if (OrderSymbol()==symbol && OrderMagicNumber()==magicNumber) {
+            //
+            if (OrderType()==ORDER_TYPE_BUY && buyStopLoss>OrderOpenPrice() && (OrderStopLoss()==0 || buyStopLoss>OrderStopLoss())) { //mod not wait for sl to exceed open
+               if (OrderModify(OrderTicket(), OrderOpenPrice(), buyStopLoss, OrderTakeProfit(), OrderExpiration())) {
+                  Print("OrderModify succeeded");
+               }
+               Print("OrderModify failed");
+            } else
+            if (OrderType()==ORDER_TYPE_SELL && sellStopLoss<OrderOpenPrice() && (OrderStopLoss()==0 || sellStopLoss<OrderStopLoss())) { ///  
+               if (OrderModify(OrderTicket(), OrderOpenPrice(), sellStopLoss, OrderTakeProfit(), OrderExpiration())) {
+                  Print("OrderModify succeeded");
+               }
+               Print("OrderModify failed");
+            }
+         }
+      }
+   }   
+}
