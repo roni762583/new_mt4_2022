@@ -1,0 +1,691 @@
+//+------------------------------------------------------------------+
+//|                                                     reDesign.mq4 |
+//|                                    Copyright 2022, Aharon Zbaida |
+//|                                           https://www.anitani.us |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2022, Aharon Zbaida"
+#property link      "https://www.anitani.us"
+#property version   "1.00"
+#property strict
+
+//+------------------------------------------------------------------+
+//|                                                     reDesign.mq4 |
+//|                                    Copyright 2022, Aharon Zbaida |
+//|                                                                  |
+//+------------------------------------------------------------------+
+//
+//
+//
+//                         H A P P Y   P R O G R A M I N G   
+//
+//
+//
+// went into production around 2022-02-16 19:14
+// 2022-04-10 returned to coding after long break, re-discover missing take profit exit or other bug/s, CheckToExit()
+// To do: why does SL not work for current settings, entire month of Sept. 2020 - Send TS To Broker breaks it in back testing
+// even when sending to broker, TS does not work in back testing
+// 2022-05-27 re-visit - added LTS STS to update higher in the CheckToExit()
+// 2022-05-29 Shavua Tov - debug ... Trailing Stop doesn't trail! (on sell side at least) If SendToBroker=false, nothing works sort of
+// '22-06-01 , 06/06. 06/07 debug TS still... )6/08/2022 TS lines are still not right, nor is TS
+
+#property copyright "Copyright 2022, Aharon Zbaida"
+#property link      "anitani.us"
+#property version   "1.22"
+#property strict
+
+extern color TS_color=clrRed;             // Trailing Stop line color
+double obj_price;                          // Right, and, Second time coordinate for Trailing Stop object
+int Error;                                // Error code for TS object
+//+------------------------------ Input Parameters -------------------------------------+
+input double maxAllowedSpread = 300;
+//input int slowMAperiodForExit = 25;
+//input int fastMAperiodForExit = 3;
+//for filtering entry signals
+//input int hourlySMAperiod = 8;
+//input double minHrDeltaFilter = 0.0007;
+// Stops
+input double TakeProfitPips    = 0;
+input bool SendTPtoBroker = False;
+//input double profitTargetDollars = 9999.0;
+// Trailig Stop
+//input double TrailingStopPips  = 15;
+// TS tightening
+//input double spreadCoeffForTrlStp = 0.8;
+//input double minProfPipsToTightTrlgStp = 20;
+// SL
+input bool UseTrailingStop = true;
+input double StopLossPips = 550;
+input bool SendSLtoBroker = true;
+//atr related
+//post release mod
+input double ATRthshld = 55;
+//input double atrLowThshldzs = 3.7;
+//input double atrHighThshldzs = 6.0;
+// Take Profit
+
+// Stale Orders
+input int expirationTimeSec = 9999999; //stale position expiration
+
+int maxSlippage = 3;
+//input double spreadAtrDiffThshld = 0; 
+//input int currentATRperiod = 1;
+//input double ATRspreadMultiple = 5.0; 
+//post release mod
+input double Lots  = 0.01;
+input int    magic = 972762583;
+//                   2147483647 // max int value
+//+-----------------------------------------------------------------------------------------+
+
+
+
+//+------------------------------ Variable Declarations -------------------------------------+
+
+double range0, tp, sl, orderTypeExitPrice, zsAbsAtr, spread,spreadATrDiff,atr_2_ago; //MacdCurrent,MacdPrevious
+//double SignalCurrent,SignalPrevious;
+double sma2mid1, sma7high1, sma7low1, fastMAmid1, fastMAmid2, slowMAmid1, slowMAmid2, smaHmid, hourMedianPrice, deltaHourlyMedianPriceNitsAvg;
+double MaCurrent,MaPrevious, atr100, stdev; //
+double sma3mid, efficiency, tsp;
+bool condA, condB, cond_UpBar0, condD, cond_DnBar0, condF, condG, condH, condI, condJ;
+bool condK, cond_HourlyMovement, cond_HrMovDirUp, cond_HrMovDirDn, cond_currentARTaboveThshld;
+bool cond_midGTsma3mid, cond_midLTsma3mid, cond_simpleStrategyEnterLong, cond_simpleStrategyEnterShort;
+bool cond_exitLong, cond_exitShort;
+bool closePosition, TSupdated, isNewBar; //isNewBar flag is on only during first iteration of each bar
+int    cnt,ticket,ordersTotal, thisBarTrade = 0;
+datetime duration, lastOpenTimeMinutes;
+double priceDeltaSL,PLpriceDelta, LTS, STS;
+string commentString;
+//+--------------------------------------------------------------------------------------------+
+
+
+
+
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- create timer
+   EventSetTimer(60);
+   LTS =0;
+   STS = 0;                                                                                  // zero value indicates program restarted, positions may or may not be open
+   lastOpenTimeMinutes = TimeCurrent();
+   commentString = "1.22";                                                                   //not used, all orders use this comment at this time
+   
+   //DrawTS();                                                                                 // Calling user-def. func. of creation
+   //---
+   //GetCSIrankings() of higher time frames
+   return(INIT_SUCCEEDED);
+}
+
+/*
+GetCSIrankings() 
+{
+//GetSymbols?()
+n = 5                                                                                        //number of tradable symbols
+//perform calculations put into arrays with matching index
+string symbolsArray[]
+double CSIrankingsArray[]
+return 
+}
+*/
+
+
+
+//+------------------------------------------------------------------+
+//| OnTick function                                             |
+//+------------------------------------------------------------------+
+void OnTick(void)
+{
+   // spread
+   RefreshRates();
+   spread  = (Ask-Bid)/Point;
+   
+   
+   // Comments on chart
+   bool isSpreadFloating = SymbolInfoInteger(Symbol(),SYMBOL_SPREAD_FLOAT);
+   string spreadString  = (isSpreadFloating ? "floating" : "fixed") + IntegerToString(SymbolInfoInteger(Symbol(),SYMBOL_SPREAD));
+   Comment(spreadString);
+   
+   
+   // prevent spread explosion from taking out S/L
+   if(spread>maxAllowedSpread) return;                                                       // az 2022/03/01 prevent s/l from getting killed by spread explosion (some brokers in off hours)
+   
+   
+   // set minimum number of chart bars required to run
+   if(Bars<100)
+   {
+      Print("bars less than 100");
+      return;
+   }
+
+   //--- go trading only for first ticks of new bar
+   // ref: https://www.forexfactory.com/thread/953088-best-way-to-code-trade-once-per-bar
+   //if(currBarsCount>prevBarsCount && tickVolume<5) {
+   //   Print("hello from OnTick(), spread = ", spread);
+   //}
+   isNewBar = false;
+   if (Bars != thisBarTrade && Volume[0]<2) { // once per bar code
+      thisBarTrade = Bars;
+      isNewBar = true;
+      // Print("OnTick() New Bar, Tick Volume = ", Volume[0], "  isNewBar=",isNewBar);
+   } // once per bar code
+   
+   
+     
+   // Indicator Variables
+   range0 = High[0]-Low[0]; //use instead of iATR() to prevent gaps from triggering ?
+   //atr_2_ago = iATR(NULL,0,currentATRperiod,2);
+   //atr100 = iATR(NULL,0,100,0);
+   //for entry
+   //efficiency = 0; //to avoid uninitialized
+   //if (High[0]-Low[0] > 0) efficiency = MathAbs((Close[0]-Open[0])/(High[0]-Low[0]));      // net/range
+   //sma3mid = iMA(NULL,0,3,0,MODE_SMA,PRICE_MEDIAN,0);
+   //sma2mid1 = iMA(NULL,0,2,0,MODE_SMA,PRICE_MEDIAN,1);
+   //sma7high1 = iMA(NULL,0,7,0,MODE_SMA,PRICE_HIGH,1);
+   //sma7low1 = iMA(NULL,0,7,0,MODE_SMA,PRICE_LOW,1);
+   //for exit
+   //fastMAmid1 = iMA(NULL,0,fastMAperiodForExit,0,MODE_SMA,PRICE_MEDIAN,1);
+   //fastMAmid2 = iMA(NULL,0,fastMAperiodForExit,0,MODE_SMA,PRICE_MEDIAN,2);
+   //slowMAmid1 = iMA(NULL,0,slowMAperiodForExit,0,MODE_SMA,PRICE_MEDIAN,1);
+   //slowMAmid2 = iMA(NULL,0,slowMAperiodForExit,0,MODE_SMA,PRICE_MEDIAN,2);
+   //for filtering entry signals
+   //smaHmid   = iMA(NULL, PERIOD_H1, hourlySMAperiod, 0, MODE_SMA, PRICE_MEDIAN, 0);
+   //hourMedianPrice = iClose(Symbol(),PERIOD_H1,0);
+   //deltaHourlyMedianPriceNitsAvg = hourMedianPrice - smaHmid;
+   //minimum volatility
+   //spreadATrDiff = (range0/Point) - spread;
+   //MaCurrent=iMA(NULL,0,100,0,MODE_SMA,PRICE_CLOSE,0);
+   //MaPrevious=iMA(NULL,0,MATrendPeriod,0,MODE_EMA,PRICE_CLOSE,1);
+   //stdev = iStdDev(NULL,0,100,0,MODE_SMA,PRICE_CLOSE,0);
+   //zsAbsAtr = MathAbs((range0-atr100)/stdev);
+   //Print("zsAbsAtr: ", zsAbsAtr);
+   
+   // Signal conditions
+   cond_currentARTaboveThshld = range0/Point > ATRthshld;
+   //double mid = (iHigh(NULL,0,0)+iLow(NULL,0,0))/2;                                        //NULL is current chart symbol, 0 is current chart time frame
+   //cond_midGTsma3mid = mid>sma3mid;                                                        //mid price greater than its' average
+   //cond_midLTsma3mid = mid<sma3mid;
+                                                      //mid price greater than its' average
+   //Simple Strategy Entery Signals
+   //cond_simpleStrategyEnterLong = cond_midGTsma3mid && cond_currentARTaboveThshld;         // enter long
+   //cond_simpleStrategyEnterShort = cond_midLTsma3mid && cond_currentARTaboveThshld;        // enter short
+   
+   // condA = zsAbsAtr>atrLowThshldzs;                                                       //atr zs above thshld
+   // condB = zsAbsAtr<atrHighThshldzs;                                                      //atr zs below thshld
+   cond_UpBar0 = Close[0]>Open[0];                                                           //up bar
+   cond_DnBar0 = Close[0]<Open[0];                                                           //down bar
+   //condD = spreadATrDiff > spreadAtrDiffThshld;                                            //is the ATR larger than Thshld
+   // condF = range0/Point > ATRspreadMultiple*spread;                                       //current ATR exceeded desired spread multiple
+   //condG = atr_2_ago/Point > ATRspreadMultiple*spread;                                     //ATR 2 periods ago exceeded desired spread multiple
+   
+   // calculate relative to previous bar to know all price values are in, trade on next bar
+   //condH = sma2mid1 > sma7high1;                                                           //enter long
+   //condI = sma2mid1 < sma7low1;                                                            //enter short
+   //condJ = fastMAmid2 > slowMAmid2 && fastMAmid1 < slowMAmid1;                             //exit long slowMAperiodForExit
+   //condK = fastMAmid2 < slowMAmid2 && fastMAmid1 > slowMAmid1;                             //exit short fastMAperiodForExit
+   
+   //if no movement at Hourly chart, don't trade
+   //cond_HourlyMovement = MathAbs(deltaHourlyMedianPriceNitsAvg) > minHrDeltaFilter;        // can be expressed as spread multiple NJ Feb. 09, 2022
+   //cond_HrMovDirUp = deltaHourlyMedianPriceNitsAvg >0;
+   //cond_HrMovDirDn = !cond_HrMovDirUp;
+   cond_exitLong =  False;
+   cond_exitShort = False;
+   
+   
+   
+   // Orders Accounting
+   ordersTotal = OrdersTotal(); // total open and pending orders
+   
+   
+   
+   if(ordersTotal>=1) {  // If Open Orders, update TS and chart graphics , else Check To Enter
+      
+      // Check to exit open positions
+      CheckToExit();
+      return;
+   }
+   
+   
+   datetime oct;                                                                             // temp. var. for order close time
+   
+   if(ordersTotal<1) {   
+   /*                                                                    // if no open orders
+      // Check if last order closed was recent in bar
+      // retrieving info from trade history
+      int i,hstTotal=OrdersHistoryTotal();
+      for(i=0;i<hstTotal;i++) {                                                              // loop over historical orders
+         ResetLastError();                                                                      // reset error codes
+         if(OrderSelect(i,SELECT_BY_POS,MODE_HISTORY)==false) {                                 // if order select failed...
+           Print("Access to history failed with error (",GetLastError(),")");                   // print error
+           break;                                                                               // break out of for loop
+         }
+         
+         // get order close time stamp
+         oct = OrderCloseTime();
+         // open time of bar opened on
+         datetime orderBarOpenTimeMinute = TimeMinute(oct); //TimeDay(oct) + TimeHour(oct) +
+         
+         Print("orderBarOpenTimeMinute = ", orderBarOpenTimeMinute, "   loop index =", i);
+         Print("Current Time Minute = ", TimeMinute(TimeCurrent()), "   loop index =", i);
+         
+         if(orderBarOpenTimeMinute != TimeMinute(TimeCurrent()) ) {                          // if new minute since last close
+            Print("new bar after order close discovered");
+            // CheckToEnter();                                                                  // only enter in new bar since last close
+            return;                                                                          // return      
+         }
+         
+      } // loop over historical orders  
+      */
+      CheckToEnter();                                                                                    
+   } // if no open orders
+} //OnTick(void)
+
+
+
+
+//+------------------------------------------------------------------+
+//| CheckToExit function                                             |
+//+------------------------------------------------------------------+
+//CheckToExit()
+void CheckToExit() {
+   // This function is called when there is an open trade to manage exit/s
+   
+   // Types of exits to check for:
+   // - Hard SL in pips
+   // - Stale-loosing positions
+   // - Signal based exit
+   // - Trailing SL in pips
+   // - TakeProfitPips
+   
+   // Variations: Long, Short, Send to broker/Don't
+   
+   // Plan of Action:
+   // - check exits that affect both Longs and Shorts at once: Hard SL pips, Stale-loosing positions, TakeProfitPips
+   // then exit signals
+   // Trailing Stop: calc. SL, TP for Long and Short positions
+   
+   
+   
+   for(cnt=0;cnt<ordersTotal;cnt++)                                                          //loop over open and pending orders total
+   {
+      if(!OrderSelect(cnt,SELECT_BY_POS,MODE_TRADES)) continue;                              //selects both open and pending orders
+      
+      if(OrderType()<= OP_SELL && OrderSymbol()==Symbol() && OrderMagicNumber()==magic)      // selects for Opened Position in this symbol, this magic
+      {
+      
+         // this position PL in pips
+         double orderPips = OrderProfit()/OrderLots();
+         
+         
+         // set correct exit price, for Buy exits on Bid, Sell is Ask                   
+         if(OrderType()==0){orderTypeExitPrice = Bid;}                                       // for Long positions, enter on Ask, exit on Bid      
+         else {orderTypeExitPrice = Ask;}                                                    // for Short position, enter on Bid, exit on Ask
+         
+         
+         // deal with trailing stops
+         if(UseTrailingStop) {
+            // flag used with send to broker on TS update
+            TSupdated = false;                                                               // reset flag
+            
+            
+            // IN CASE EA WAS RESET, TERMINAL RESTARTED, ETC.
+            if( (LTS==0 && OrderType()==OP_BUY) || (STS==0  && OrderType()==OP_SELL) ) {     // in case OnInit() was hit... (s.a. after restart,...)
+               // so at this point we have an open order with INTERNAL Trailing Stop Var not set, 
+               
+               // close losing order exeeding initial SL, IN CASE OF EA RESET
+               if(OrderProfit()<0 && MathAbs(orderPips)>=StopLossPips){                      // if position reached SL pips ...
+                  CloseOrder(OrderTicket(), "Order Closed on initial SL AFTER EA RESET!");   // ... Close it!
+                  return;
+               }
+               else {                                                                        // else, assign STS / LTS as the case may be
+                  if(orderPips<=0) {                                                        // IF ORDER IS IN RED, BUT DID NOT REACH STOP LEVEL (NOT CLOSED ABOVE)
+                     if(OrderType()==OP_BUY) {                                               // for Long orders
+                        LTS = OrderOpenPrice() - StopLossPips*Point;                         // ASSIGN LTS
+                        TSupdated = true;                                                    // set flag for use with send to broker
+                        DrawTS(true);                                                        // draw LTS line
+                     }
+                     if(OrderType()==OP_SELL) {                                              // for Short orders
+                        STS = OrderOpenPrice() + StopLossPips*Point;                         // ASSIGN LTS
+                        TSupdated = true;                                                    // set flag for use with send to broker
+                        DrawTS(false);                                                       // draw STS line
+                     }
+                  } // if(orderPips<=0)
+               } // else
+            } // in case OnInit()where LTS/STS NOT ASSIGNED S.A. AFTER SOME RESET
+            
+            
+            // update Trailing Stop
+            if(OrderType()==OP_BUY) {                                                        // FOR LONG POSITION
+               if(orderTypeExitPrice - LTS > StopLossPips*Point) {                           // if price moved, and TS needs update
+                  LTS = orderTypeExitPrice - StopLossPips*Point;                             // ASSIGN LTS IAW STOP LOSS PIPS
+                  TSupdated = true;                                                          // FLAG TS UPDATE
+                  DrawTS(true);                                                              // draw LTS line
+               } // if price moved enough to affect TS
+            }// if OP_BUY
+            
+            else if(OrderType()==OP_SELL) {                                                  // FOR Short POSITION
+               if(STS - orderTypeExitPrice > StopLossPips*Point) {                           // if price moved, and TS needs update
+                  STS = orderTypeExitPrice + StopLossPips*Point;                             // ASSIGN STS IAW STOP LOSS PIPS
+                  TSupdated = true;                                                          // Flag TS update
+                  DrawTS(false);                                                             // draw STS line
+               }  // if price moved enough to affect TS
+            } // else if(OrderType()==OP_SELL) { 
+               
+
+            
+            // Did Price cross Trailing Stop
+            closePosition = False;                                                           // reset flag
+            if(OrderType()== OP_BUY) { closePosition = orderTypeExitPrice - LTS <= 0; }      // check for Long positions, and set flag to close position
+            else if(OrderType()== OP_SELL) { closePosition = STS - orderTypeExitPrice <= 0; }// check for Short positions, and set flag to close position
+                 
+            // Close position based on flag
+            if(closePosition) {
+               closePosition = false;                                                        // reset flag
+               CloseOrder(OrderTicket(), "closed on trailing stop");
+               return;
+            }
+            
+            
+            // if SendSLtoBroker, and TS level updatedsend OrderModify()
+            if(SendSLtoBroker && TSupdated) {     //send updated TS to broker
+            
+               double stopPrice  = 0;                                                        // reset price var.
+               TSupdated = false;                                                            // reset flag
+               
+               if(OrderType()==OP_BUY){stopPrice = LTS;} else {stopPrice = STS;}             // set correct TS
+               ResetLastError();                                                             // reset last error code
+                                                                                             // Send Modify Order
+               if(OrderModify(OrderTicket(),OrderOpenPrice(),stopPrice,OrderTakeProfit(),0,Green))
+                  Print("order modified, updated TS=",stopPrice);
+               else { 
+                  Print("Order Modify error ",GetLastError());                               // print order modify error
+                  return;
+               }
+               
+            } // if(SendSLtoBroker && TSupdated)
+            
+            /*
+            // Trailing Stop Line Object Update
+            ResetLastError();                               //--- reset the error value
+            obj_price=ObjectGet("TS_line",OBJPROP_PRICE);   // Requesting obj_price coord.
+            Error=GetLastError();                           // Getting an error code
+            if (Error==4202) {                              // If no object :(
+               //Alert("TS LTS=  ...",LTS);
+               DrawTS();                        // Calling user-def. func. of creation
+               //obj_price=Time[0];                      // Current value of obj_price coordinate
+            }
+            if (obj_price!=Bid)                    // If object is not in its place
+            {
+               if(LTS==0 && STS==0) obj_price=0;
+               else obj_price = MathMax(LTS,STS);
+               ObjectMove("TS_line", 0, Time[0], obj_price); //New t1 coord.
+               //ObjectMove("TS_line", 1, Time[0],       0); //New obj_price coord.
+               WindowRedraw();                  // Redrawing the image 
+            }
+             */
+         } // if(UseTrailingStop)
+            
+         else { // DON'T Trailing Stop, i.e. Stop Loss is Hard Stop 
+          
+            if(orderPips<0 && MathAbs(orderPips)>=StopLossPips){                 // if position reached SL pips ...
+               CloseOrder(OrderTicket(), "hard S/L reached, position closed");   // ... Close it!
+
+               return;
+            } // if position reached hard SL pips
+         } // if(!UseTrailingStop)
+         
+            
+            
+            
+         // Exit Stale-loosing Positions
+         if(IsTesting()) duration = Time[0]-OrderOpenTime(); // calculate duration variable considering Testing Mode
+         else duration = TimeCurrent()-OrderOpenTime();
+         if(duration>=expirationTimeSec && OrderProfit()<0) // Check for Stale-Losing Positions
+         {
+            CloseOrder(OrderTicket(), "Stale Position Close");
+            return;
+         }
+         
+         
+         // Check for TakeProfitPips
+         if(TakeProfitPips - orderPips <= 0)
+         {
+            CloseOrder(OrderTicket(), "TakeProfitPips Close");
+            return;
+         }
+         
+         
+         // Deal with Long Position Exits
+         if(OrderType()==OP_BUY)
+         {
+            // Signal based exit
+            if(cond_exitLong)
+            {
+               //--- close order and exit
+               CloseOrder(OrderTicket(), "closed on cond_exitLong");
+               return;
+            } 
+         } // if(OrderType()==OP_BUY)
+         
+         else { // Short Position - // Check Exits for SHORT POSITION
+              
+            // Signal based exit
+            if(cond_exitShort)
+            {
+               //--- close order and exit
+               CloseOrder(OrderTicket(), "closed on cond_exitShort");
+               return;
+            }
+         } // Short Position
+         
+      } //if(open position this symbol
+   } //loop over open & pending orders  
+}//CheckToExit()
+
+
+
+
+
+//+-------------------------------------------|
+//|         Close Order Function              | 
+//+-------------------------------------------|
+bool CloseOrder(int tickt, string extstrtg) { // take ticket numbet, and exit strategy string
+      int os = OrderSelect(tickt,SELECT_BY_TICKET);
+      int ot = OrderType();
+      //--- close order and exit
+      if(!OrderClose(tickt,OrderLots(),Bid,maxSlippage,Pink)) {
+         Print("OrderClose error ",GetLastError(),"\n Exit Strategy String: ", extstrtg);
+         return false;
+      }
+      Print("Type=", ot, "   ",   extstrtg, "     STS=", STS, "     LTS=", LTS,"  Bid=", Bid, "   Ask=", Ask);
+      return true;
+} //CloseOrder()
+   
+
+
+
+//+------------------------------------------------------------------+
+//| Check Sufficient Funds function, OMS support functtion                                |
+//+------------------------------------------------------------------+
+bool CheckSufficientFunds (){
+   
+      // check for sufficient funding
+      if(AccountFreeMargin()<(1000*Lots))
+      {
+         Print("We have no money. Free Margin = ",AccountFreeMargin());
+         return false;
+      }
+      return true;
+}
+
+//+------------------------------------------------------------------+
+//| CheckToEnter function                                            |
+//+------------------------------------------------------------------+
+//CheckToEnter()
+void CheckToEnter()
+{ 
+   //Don't enter same bar twice
+   datetime thisBar = Time[0];
+   datetime lastOpen = lastOpenTimeMinutes;
+   //di
+   datetime diff = thisBar-lastOpen;
+
+   ObjectDelete("TS_line");         // Deleting the object
+
+   if(diff<StrToTime("1970.01.01 00:01:00")) { //60 sec. (for 1M chart)
+      //Print("thisBar",thisBar);
+      //Print("lastOpen",lastOpen);
+      //Print("diff()=",diff);
+      //Print("!!! don't enter on same bar twice !!!");
+      return; // don't enter on same bar twice
+   }
+   
+   
+   
+   // Check for Long entry (BUY)
+   if(cond_currentARTaboveThshld && cond_UpBar0) // atr above thshld on up bar 0 index
+   { 
+      //refresh rates and calc. S/L, T/P
+      RefreshRates();
+      
+      
+      // calc. take profit for BUY order
+      if(TakeProfitPips>0 && SendTPtoBroker) tp=Ask+TakeProfitPips*Point;
+      else tp=0;
+      
+      
+      // calc. stop loss
+      if(StopLossPips>0 && SendSLtoBroker) sl = Ask - StopLossPips*Point;
+      else sl = 0;
+      
+      
+      // send order
+      ticket=OrderSend(Symbol(),OP_BUY,GetLots(),Ask,maxSlippage,sl,tp, commentString,magic,0,Green);
+      
+      int os = OrderSelect(ticket,SELECT_BY_TICKET);
+      lastOpenTimeMinutes = OrderOpenTime();
+      
+      //if trade succeeded, notify
+      if(ticket>0)
+      {
+         if(OrderSelect(ticket,SELECT_BY_TICKET,MODE_TRADES)) {
+            LTS = OrderOpenPrice() - StopLossPips*Point;
+            Print("BUY order opened : ",OrderOpenPrice());
+         }
+      }
+      else Print("Error opening BUY order : ",GetLastError());
+      
+   } // end Check for Long entry
+   
+   
+   // Check for Short entry (SELL) 
+   if(cond_currentARTaboveThshld && cond_DnBar0) // atr above thshld on down bar 0 index
+   {
+      //refresh rates and calc. S/L, T/P
+      RefreshRates();
+      
+      //calc. take profit for SELL order
+      if(TakeProfitPips>0 && SendTPtoBroker) tp=Bid-TakeProfitPips*Point;
+      else tp=0;
+      
+      //set stop loss
+      if(StopLossPips>0 && SendSLtoBroker) sl = Bid + StopLossPips*Point;
+      else sl = 0;
+      //Print("order send sell sl=",sl," tp=",tp," Bid=",Bid);
+      //send order
+      ticket=OrderSend(Symbol(),OP_SELL ,GetLots(),Bid,maxSlippage,sl,tp,commentString,magic,0,Green);
+     
+      int os = OrderSelect(ticket,SELECT_BY_TICKET);
+      lastOpenTimeMinutes = OrderOpenTime();
+      
+      //if trade succeeded, notify
+      if(ticket>0)
+      {
+         if(OrderSelect(ticket,SELECT_BY_TICKET,MODE_TRADES)) {
+            STS = OrderOpenPrice() + StopLossPips*Point;
+            Print("SELL order opened : ",OrderOpenPrice());
+         }
+      }
+      else Print("Error opening BUY order : ",GetLastError());
+   }//if check for short entry
+   
+}// CheckToEnter()
+
+
+
+
+
+//+------------------------------------------------------------------+
+//| GetLots function                                                 |
+//+------------------------------------------------------------------+ 
+double GetLots()
+{
+   // if user set Lots to 0, use Acct. Margin based position sizing
+   if(Lots==0 || Lots<0)
+     {
+      double factor = MathAbs(Lots);
+      double lots = AccountFreeMargin()*factor/100000;
+      //Print("AccountFreeMargin() :  ", AccountFreeMargin());
+      Print("lots: ",lots);
+      return lots; // 
+     }
+      return Lots;
+}
+
+
+
+
+//+------------------------------------------------------------------+
+//| Timer function                                                   |
+//+------------------------------------------------------------------+
+void OnTimer() {
+   
+}
+
+
+
+//+------------------------------------------------------------------+
+//| Tester function                                                  |
+//+------------------------------------------------------------------+
+double OnTester()  {
+   double ret=0.0;
+
+   return(ret);
+}
+
+
+
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   ObjectDelete("TS_line");         // Deleting the object
+   
+   //--- destroy timer
+   EventKillTimer();
+   
+}
+
+void DrawTS(bool LTSorSTS) {
+   ObjectDelete("TS_line");                                                                  // delete old line if there
+   
+   if(LTSorSTS==true)                                                                        // for Long order
+      if(!ObjectCreate("TS_line",OBJ_HLINE,0,Time[0], LTS))                                  // create LTS line
+         Print("Drawing LTS failed!");// Create LTS line                                     // ...print error notification on fail
+   else                                                                                      // for Short order
+      if(!ObjectCreate("TS_line",OBJ_HLINE,0,Time[0], STS))                                  // create SLS line
+         Print("Drawing STS failed!");                                                       // ...print error notification on fail
+   
+   ObjectSet(   "TS_line", OBJPROP_COLOR, TS_color);                                         // set line Color
+   //ObjectSet(   "TS_line", OBJPROP_RAY,   false);                                          // set Ray property
+   ObjectSet(   "TS_line", OBJPROP_STYLE, STYLE_SOLID);                                      // set line Style property
+
+   WindowRedraw();                                                                           // render drawing
+}
+
+
+
+
